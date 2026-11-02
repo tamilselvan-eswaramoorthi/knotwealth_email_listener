@@ -9,4 +9,7 @@ class Config:
     DB_SCHEMA = os.getenv('DB_SCHEMA', 'dbo').strip()
 
     USER_EMAIL = os.getenv("USER_EMAIL", "")
-    TRANSACTIONS_USER_ID = os.getenv("TRANSACTIONS_USER_ID", "")
+    TRANSACTIONS_USER_ID = os.getenv("TRANSACTIONS_USER_ID", "ZdN31Wb3GLY36wZPUcBDrP3Qmbw1")
+
+    # Shared secret the Apps Script poller sends in the X-API-Key header
+    API_KEY = os.getenv("API_KEY", "").strip()

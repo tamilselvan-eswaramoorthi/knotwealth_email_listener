@@ -4,179 +4,60 @@ import json
 import uuid
 import email as email_lib
 from email import policy as email_policy
+from email.utils import parsedate_to_datetime
 from sqlmodel import select
 
 from datetime import datetime, timezone
 
-from google.auth.exceptions import RefreshError
-from google.auth.transport.requests import Request
-from google.oauth2.credentials import Credentials
-from googleapiclient.discovery import build
-
 from config import Config
 from utilities.pdf_processor import ExtractHoldings
 from utilities.reconcile import process_and_reconcile_from_cas
-from database import db_handler, GoogleOAuthToken, User, Holdings, Transaction, IPO, Stock
+from database import db_handler, User, Holdings, Transaction, IPO, Stock
 
 class GetHoldingsFromGmail:
     def __init__(self):
-        self.service = None
         self.extractor = ExtractHoldings()
         self.user_id = None
         self.PASSWORD = None
-        self.SCOPES = ["https://www.googleapis.com/auth/gmail.readonly"]
         self.zerodha_query = "from:no-reply-transaction-with-holding-statement@reportsmailer.zerodha.net"
         self.cas_query = "from:eCAS@cdslstatement.com"
         self.nse_query = "from:nse-direct@nse.co.in"
         self.bse_query = "from:mgrpt@bseindia.com"
-        self.auth_error = None
-        try:
-            self.authenticate()
-        except Exception as e:
-            self.auth_error = e
-
-    def _credentials_expiry(self, expiry):
-        if not expiry:
-            return None
-        if expiry.tzinfo:
-            return expiry.astimezone(timezone.utc).replace(tzinfo=None)
-        return expiry
-
-    def _store_credentials(self, session, user_token, creds):
-        token_dict = json.loads(creds.to_json())
-        user_token.token = token_dict.get("token", user_token.token)
-        if "expiry" in token_dict and token_dict["expiry"]:
-            expiry = datetime.fromisoformat(token_dict["expiry"].replace("Z", "+00:00"))
-            user_token.expiry = expiry.astimezone(timezone.utc).replace(tzinfo=None)
-        session.add(user_token)
-        session.commit()
 
     def _get_user_details(self, user_id: str):
         with db_handler.get_session() as session:
             user = session.exec(select(User).where(User.user_id == user_id)).first()
             self.PASSWORD = user.pan_card # type: ignore
 
-    def authenticate(self):
-        creds = None
-        with db_handler.get_session() as session:
-            user_token = session.exec(select(GoogleOAuthToken).where(GoogleOAuthToken.user_id == Config.TRANSACTIONS_USER_ID)).first()
-            if user_token:
-                creds = Credentials(
-                    token=user_token.token,
-                    refresh_token=user_token.refresh_token,
-                    token_uri=user_token.token_uri,
-                    client_id=user_token.client_id,
-                    client_secret=user_token.client_secret,
-                    scopes=user_token.scopes.split(",") if user_token.scopes else self.SCOPES,
-                    expiry=self._credentials_expiry(user_token.expiry)
-                )
-            
-            if not creds or not creds.valid:
-                if creds and creds.refresh_token:
-                    try:
-                        creds.refresh(Request())
-                        self._store_credentials(session, user_token, creds)
-                    except RefreshError as e:
-                        raise Exception("Google OAuth token expired or revoked. Please re-authenticate the application.") from e
-                else:
-                    raise Exception("No valid credentials found for user. User must re-authenticate.")
-                    
-        self.service = build("gmail", "v1", credentials=creds)
-
-    def force_reauthenticate(self):
-        """Force refresh the credentials to get a new access token and verify connectivity."""
-        with db_handler.get_session() as session:
-            user_token = session.exec(select(GoogleOAuthToken).where(GoogleOAuthToken.user_id == Config.TRANSACTIONS_USER_ID)).first()
-            if not user_token:
-                raise Exception("No credentials found in database to refresh.")
-            
-            creds = Credentials(
-                token=user_token.token,
-                refresh_token=user_token.refresh_token,
-                token_uri=user_token.token_uri,
-                client_id=user_token.client_id,
-                client_secret=user_token.client_secret,
-                scopes=user_token.scopes.split(",") if user_token.scopes else self.SCOPES,
-                expiry=self._credentials_expiry(user_token.expiry)
-            )
-            print (creds)
-            if creds.refresh_token:
-                try:
-                    creds.refresh(Request())
-                    self._store_credentials(session, user_token, creds)
-                    print("Credentials successfully refreshed and stored via scheduled re-authentication.")
-                    self.authenticate()
-                    self.auth_error = None
-                except RefreshError as e:
-                    import traceback
-                    traceback.print_exc()
-                    # raise Exception("Google OAuth token has expired or been revoked. Manual re-authentication required.") from e
-            else:
-                pass
-                # raise Exception("No refresh token available to perform background re-authentication.")
-
-    def get_attachments_in_memory(self, user_id, msg_id, payload):
+    def get_attachments_in_memory(self, msg):
+        """Collect attachments from a parsed email. Attached emails (message/rfc822) are returned
+        as .eml bytes and not descended into; process_attachment_recursive handles them."""
         attachments = []
-        
-        parts = [payload] if "parts" not in payload else payload["parts"]
-        queue = parts[:]
-        
-        while queue:
-            part = queue.pop(0)
-            
-            if part.get("filename"):
-                filename = part["filename"]
-                attachment_id = part["body"].get("attachmentId")
-                data = part["body"].get("data")
-                
-                if attachment_id:
-                    try:
-                        attachment = self.service.users().messages().attachments().get( # type: ignore
-                            userId=user_id, messageId=msg_id, id=attachment_id).execute()
-                    except Exception as e:
-                        if "invalid" in str(e).lower() or "credential" in str(e).lower() or "401" in str(e):
-                            print("Credential error during attachment download. Attempting force re-authentication and retry...")
-                            self.force_reauthenticate()
-                            self.authenticate()
-                            attachment = self.service.users().messages().attachments().get( # type: ignore
-                                userId=user_id, messageId=msg_id, id=attachment_id).execute()
-                        else:
-                            raise e
-                    data = attachment.get("data")
-                
+
+        def walk(part):
+            content_type = part.get_content_type()
+            filename = part.get_filename()
+            if content_type == "message/rfc822":
+                inner = part.get_payload(0)
+                attachments.append({"filename": filename or "forwarded.eml", "data": inner.as_bytes()})
+            elif part.is_multipart():
+                for sub in part.iter_parts():
+                    walk(sub)
+            elif filename:
+                data = part.get_payload(decode=True)
                 if data:
-                    file_data = base64.urlsafe_b64decode(data.encode('UTF-8'))
-                    # Store the bytes directly instead of writing to disk!
-                    attachments.append({"filename": filename, "data": file_data})
-                    
-            if "parts" in part:
-                queue.extend(part["parts"])
-                
+                    attachments.append({"filename": filename, "data": data})
+
+        walk(msg)
         return attachments
 
-    def _get_body_text(self, payload):
+    def _get_full_body_text(self, msg):
         text = ""
-        if 'body' in payload and 'data' in payload['body']:
-            try:
-                text = base64.urlsafe_b64decode(payload['body']['data']).decode('utf-8', errors='ignore')
-                text = text.split('\n')[5]
-            except:
-                pass
-        elif 'parts' in payload:
-            for part in payload['parts']:
-                text += self._get_body_text(part)
-        return text
-
-    def _get_full_body_text(self, payload):
-        text = ""
-        if 'body' in payload and 'data' in payload['body']:
-            try:
-                text = base64.urlsafe_b64decode(payload["body"]["data"]).decode("utf-8", errors="ignore")
-            except:
-                pass
-        elif 'parts' in payload:
-            for part in payload['parts']:
-                text += self._get_full_body_text(part)
+        for part in msg.walk():
+            if part.get_content_maintype() == "text" and not part.get_filename():
+                payload = part.get_payload(decode=True)
+                if isinstance(payload, bytes):
+                    text += payload.decode(part.get_content_charset() or "utf-8", errors="ignore")
         return text
 
     def _detect_broker_from_text(self, text: str):
@@ -189,11 +70,6 @@ class GetHoldingsFromGmail:
             return "AngelOne"
         return None
 
-    def _detect_broker_from_email(self, msg):
-        payload = msg.get("payload", {})
-        body_text = self._get_full_body_text(payload).lower()
-        return self._detect_broker_from_text(body_text)
-
     def _extract_nse_date_from_text(self, full_text: str):
         match = re.search(r"for   (\d{1,2}-[A-Z]{3,}-\d{4})", full_text)
         if match:
@@ -205,11 +81,6 @@ class GetHoldingsFromGmail:
             except:
                 return date_str
         return None
-
-    def _extract_nse_date(self, msg):
-        payload = msg.get('payload', {})
-        full_text = self._get_body_text(payload)
-        return self._extract_nse_date_from_text(full_text)
 
     def _extract_info_from_eml(self, eml_data):
         msg = email_lib.message_from_bytes(eml_data, policy=email_policy.default)
@@ -431,36 +302,20 @@ class GetHoldingsFromGmail:
                 session.add(h)
             session.commit()
 
-    def process_transactions(self, message_id: str):
+    def process_transactions(self, message_id: str, raw_email: bytes):
         """Process email transactions.
 
         Args:
             message_id (str): The ID of the email message to process.
+            raw_email (bytes): The full RFC 822 email, as sent by the Apps Script poller.
         """
-        if self.auth_error:
-            raise self.auth_error
+        msg = email_lib.message_from_bytes(raw_email, policy=email_policy.default)
 
-        try:
-            msg = self.service.users().messages().get(userId="me", id=message_id).execute() # type: ignore
-        except Exception as e:
-            if "invalid" in str(e).lower() or "credential" in str(e).lower() or "401" in str(e):
-                print("Credential error during API call. Attempting force re-authentication and retry...")
-                try:
-                    self.force_reauthenticate()
-                    self.authenticate()
-                    msg = self.service.users().messages().get(userId="me", id=message_id).execute()
-                except Exception as retry_err:
-                    print(f"Retry after force re-authentication failed: {retry_err}")
-                    return {'status': 500, 'message': f"Error fetching message after reauth retry: {retry_err}"}
-            else:
-                print(f"Error fetching message {message_id}: {e}")
-                return {'status': 500, 'message': f"Error fetching message: {e}"}
-        
         sender = None
         user_email = None
-        for h in msg.get("payload", {}).get("headers", []):
-            name = h.get("name", "").lower()
-            value = h.get("value", "").lower()
+        for name, value in msg.items():
+            name = name.lower()
+            value = str(value).lower()
             if name in ['to', 'delivered-to', 'x-original-to']:
                 user_email = value
             if name in ["from"]:
@@ -468,7 +323,7 @@ class GetHoldingsFromGmail:
                 if match:
                     sender = match.group(0)
 
-        attachments = self.get_attachments_in_memory("me", msg['id'], msg.get("payload", {}))
+        attachments = self.get_attachments_in_memory(msg)
 
         if not sender:
             print(f"Could not determine sender for message ID: {message_id}")
@@ -492,9 +347,13 @@ class GetHoldingsFromGmail:
                 
         print (f"Email from: {sender}, User email: {user_email}, Attachments found: {len(attachments)}")
 
-        email_sent_time = msg.get("internalDate")
-        email_sent_date = datetime.fromtimestamp(int(email_sent_time) / 1000, tz=timezone.utc).strftime("%Y-%m-%d")
-        broker_name = self._detect_broker_from_email(msg)
+        email_sent_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        if msg.get("Date"):
+            try:
+                email_sent_date = parsedate_to_datetime(str(msg["Date"])).astimezone(timezone.utc).strftime("%Y-%m-%d")
+            except Exception:
+                pass
+        broker_name = self._detect_broker_from_text(self._get_full_body_text(msg))
         
         any_new_data = False
 

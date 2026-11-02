@@ -9,11 +9,6 @@ pyodbc==5.0.1
 pymysql==1.0.3
 psycopg2-binary==2.9.6
 
-# Google Cloud & API
-google-api-python-client==2.116.0
-google-auth-oauthlib==1.2.0
-google-auth-httplib2==0.2.0
-
 # Utilities
 python-dotenv==1.0.0
 pymupdf==1.23.0

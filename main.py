@@ -1,33 +1,17 @@
-import asyncio
-from datetime import datetime, time, timedelta
-from fastapi import Body, FastAPI,Response
+import base64
+import binascii
+import secrets
+
+from fastapi import Body, FastAPI, Header, Response
 from sqlmodel import select
+
+from config import Config
 
 from database import db_handler, EmailTasks
 from utilities.gmail import GetHoldingsFromGmail
 
 app = FastAPI()
 
-async def run_daily_reauth():
-    while True:
-        # Calculate time until next 8 AM
-        now = datetime.now()
-        target = datetime.combine(now.date(), time(8, 0))
-        if now >= target:
-            target += timedelta(days=1)
-        
-        sleep_seconds = (target - now).total_seconds()
-        print(f"Background reauth scheduled. Sleeping for {sleep_seconds} seconds until next run at {target}")
-        await asyncio.sleep(sleep_seconds)
-        
-        print("Starting scheduled background reauth task...")
-        try:
-            gmail = GetHoldingsFromGmail()
-            gmail.force_reauthenticate()
-            print("Scheduled background reauth completed successfully.")
-        except Exception as e:
-            print(f"Scheduled background reauth failed: {e}")
- 
 @app.on_event("startup")
 async def on_startup():
     try:
@@ -35,17 +19,24 @@ async def on_startup():
         print("Database initialized successfully.")
     except Exception as e:
         print(f"Database initialization failed: {e}")
-        
-    # Start the background task
-    asyncio.create_task(run_daily_reauth())
 
 @app.post("/process")
-async def process_webhook(data: dict = Body(...)):
+async def process_webhook(data: dict = Body(...), x_api_key: str = Header(default="")):
+    # The body carries the full email, so only the Apps Script poller may call this
+    if not Config.API_KEY or not secrets.compare_digest(x_api_key, Config.API_KEY):
+        return Response(content="Unauthorized", status_code=401)
+
     # FastAPI automatically parses the JSON body into the 'data' variable
     message_id = data.get("messageId")
+    raw = data.get("raw")
 
-    if not message_id:
+    if not message_id or not raw:
         return Response(content="Invalid request", status_code=400)
+
+    try:
+        raw_email = base64.b64decode(raw)
+    except (binascii.Error, ValueError):
+        return Response(content="Invalid raw email encoding", status_code=400)
 
     print(f"Received direct request for message ID: {message_id}")
     
@@ -62,29 +53,18 @@ async def process_webhook(data: dict = Body(...)):
             session.commit()
 
     # Process outside of the initial session to avoid keeping transaction open
-    max_retries = 3
-    retry_delay = 5  # seconds
-    
-    for attempt in range(max_retries):
-        try:
-            gmail = GetHoldingsFromGmail()
-            ret = gmail.process_transactions(message_id)
-            print(f"Processing result for message ID {message_id}: {ret}")
-            status = "COMPLETED"
-            status_code = 200
-            response_content = "Processing completed successfully"
-            break
-        except Exception as e:
-            print(f"Failed to process message ID {message_id} on attempt {attempt + 1}: {e}")
-            if ("expired" in str(e).lower() or "revoked" in str(e).lower() or "credentials" in str(e).lower()) and attempt < max_retries - 1:
-                print(f"Token expired/revoked error. Waiting {retry_delay}s for potential database token update/re-auth before retrying...")
-                await asyncio.sleep(retry_delay)
-                continue
-            
-            status = "FAILED"
-            status_code = 500
-            response_content = f"Failed to process message: {str(e)}"
-            break
+    try:
+        gmail = GetHoldingsFromGmail()
+        ret = gmail.process_transactions(message_id, raw_email)
+        print(f"Processing result for message ID {message_id}: {ret}")
+        status = "COMPLETED"
+        status_code = 200
+        response_content = "Processing completed successfully"
+    except Exception as e:
+        print(f"Failed to process message ID {message_id}: {e}")
+        status = "FAILED"
+        status_code = 500
+        response_content = f"Failed to process message: {str(e)}"
 
     with db_handler.get_session() as session:
         task = session.exec(select(EmailTasks).where(EmailTasks.message_id == message_id)).first()
@@ -98,12 +78,6 @@ async def process_webhook(data: dict = Body(...)):
 @app.get("/health")
 def health_check():
     return {"status": "healthy"}
-
-@app.get("/reauth")
-def force_reauth():
-    gmail = GetHoldingsFromGmail()
-    gmail.force_reauthenticate()
-    return {"status": "reauthenticated"}
 
 if __name__ == "__main__":
     import uvicorn
