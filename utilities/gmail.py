@@ -28,7 +28,7 @@ class GetHoldingsFromGmail:
     def _get_user_details(self, user_id: str):
         with db_handler.get_session() as session:
             user = session.exec(select(User).where(User.user_id == user_id)).first()
-            self.PASSWORD = user.pan_card # type: ignore
+            self.PASSWORD = (user.pan_card or "").strip().upper() # type: ignore
 
     def get_attachments_in_memory(self, msg):
         """Collect attachments from a parsed email. Attached emails (message/rfc822) are returned
@@ -382,7 +382,9 @@ class GetHoldingsFromGmail:
                 email_sent_date = parsedate_to_datetime(str(msg["Date"])).astimezone(timezone.utc).strftime("%Y-%m-%d")
             except Exception:
                 pass
-        broker_name = self._detect_broker_from_text(self._get_full_body_text(msg))
+        body_text = self._get_full_body_text(msg)
+        email_sent_date = self._extract_nse_date_from_text(body_text) or email_sent_date
+        broker_name = self._detect_broker_from_text(body_text)
         
         any_new_data = False
 
