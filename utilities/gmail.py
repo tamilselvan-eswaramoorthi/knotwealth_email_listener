@@ -23,6 +23,7 @@ class GetHoldingsFromGmail:
         self.cas_query = "from:eCAS@cdslstatement.com"
         self.nse_query = "from:nse-direct@nse.co.in"
         self.bse_query = "from:mgrpt@bseindia.com"
+        self.STATEMENT_SENDERS = {"ecas@cdslstatement.com", "nse-direct@nse.co.in", "nse-direct@uci.nse.co.in", "mgrpt@bseindia.com"}
 
     def _get_user_details(self, user_id: str):
         with db_handler.get_session() as session:
@@ -50,6 +51,34 @@ class GetHoldingsFromGmail:
 
         walk(msg)
         return attachments
+
+    def _user_email_candidates(self, msg):
+        """Addresses that may identify the user, most reliable first, excluding our own inboxes.
+
+        Mail reaches us via user's Gmail -> (auto-forward) -> transactions@knotwealth.com ->
+        (Cloudflare) -> our Gmail, so each hop adds headers. The original recipient is in
+        X-Forwarded-For (Gmail auto-forward) or the oldest Delivered-To; for a manual forward
+        the user is the From address.
+        """
+        def addresses(header):
+            found = []
+            for value in msg.get_all(header, []):
+                found.extend(re.findall(r'[\w\.+-]+@[\w\.-]+', str(value).lower()))
+            return found
+
+        ordered = (
+            addresses("X-Forwarded-For")
+            + list(reversed(addresses("Delivered-To")))
+            + addresses("X-Original-To")
+            + addresses("To")
+            + addresses("Cc")
+            + addresses("From")
+        )
+        candidates = []
+        for address in ordered:
+            if address not in Config.INBOX_ADDRESSES and address not in candidates:
+                candidates.append(address)
+        return candidates
 
     def _get_full_body_text(self, msg):
         text = ""
@@ -312,39 +341,39 @@ class GetHoldingsFromGmail:
         msg = email_lib.message_from_bytes(raw_email, policy=email_policy.default)
 
         sender = None
-        user_email = None
-        for name, value in msg.items():
-            name = name.lower()
-            value = str(value).lower()
-            if name in ['to', 'delivered-to', 'x-original-to']:
-                user_email = value
-            if name in ["from"]:
-                match = re.search(r'[\w\.-]+@[\w\.-]+', value)
-                if match:
-                    sender = match.group(0)
+        match = re.search(r'[\w\.-]+@[\w\.-]+', str(msg.get("From", "")).lower())
+        if match:
+            sender = match.group(0)
 
         attachments = self.get_attachments_in_memory(msg)
 
         if not sender:
             print(f"Could not determine sender for message ID: {message_id}")
             return {'status': 500, 'message': f"Could not determine sender for message ID: {message_id}"}
-        
-        #extract user email from message headers
-        if user_email and "<" in user_email and ">" in user_email:
-            match = re.search(r'<(.*?)>', user_email)
-            if match:
-                user_email = match.group(1).lower()
 
-        if user_email:
-            with db_handler.get_session() as session:
-                user = session.exec(select(User).where(User.email == user_email.lower())).first()
-                if user:
-                    self.user_id = user.user_id
-                    self._get_user_details(self.user_id)
-                else:
-                    print(f"No user found for email: {user_email}")
-                    return {'status': 202, 'message': f"No user found for email: {user_email}"}
-                
+        # Manually forwarded (not auto-forwarded) emails come From the user; the statement
+        # sender is then in the "---------- Forwarded message ----------" block of the body
+        if sender not in self.STATEMENT_SENDERS:
+            forwarded = re.search(r"from:.*?([\w\.-]+@[\w\.-]+)", self._get_full_body_text(msg), re.IGNORECASE)
+            if forwarded and forwarded.group(1).lower() in self.STATEMENT_SENDERS:
+                sender = forwarded.group(1).lower()
+
+        candidates = self._user_email_candidates(msg)
+        print(f"User email candidates for message ID {message_id}: {candidates}")
+        user_email = None
+        with db_handler.get_session() as session:
+            users = session.exec(select(User).where(User.email.in_(candidates))).all() if candidates else [] # type: ignore
+            users_by_email = {u.email.lower(): u for u in users}
+            for candidate in candidates:
+                if candidate in users_by_email:
+                    user_email = candidate
+                    self.user_id = users_by_email[candidate].user_id
+                    break
+        if not self.user_id:
+            print(f"No user found for message ID {message_id} among: {candidates}")
+            return {'status': 202, 'message': f"No user found among: {candidates}"}
+        self._get_user_details(self.user_id)
+
         print (f"Email from: {sender}, User email: {user_email}, Attachments found: {len(attachments)}")
 
         email_sent_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")

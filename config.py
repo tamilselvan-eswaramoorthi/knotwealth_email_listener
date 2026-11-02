@@ -13,3 +13,10 @@ class Config:
 
     # Shared secret the Apps Script poller sends in the X-API-Key header
     API_KEY = os.getenv("API_KEY", "").strip()
+
+    # Our own receiving addresses; never treated as the user's email
+    INBOX_ADDRESSES = {
+        a.strip().lower()
+        for a in os.getenv("INBOX_ADDRESSES", "transactions@knotwealth.com,knotwealth.transactions@gmail.com").split(",")
+        if a.strip()
+    }
