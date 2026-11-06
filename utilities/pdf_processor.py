@@ -1,5 +1,7 @@
+import io
 import re
 import fitz
+import pypdf
 import camelot
 import tempfile
 import pandas as pd
@@ -225,7 +227,18 @@ class ExtractHoldings:
             doc.authenticate(password)
         return doc
     
+    def _check_password(self, pdf_source, password):
+        """Fail with a clear message when the PAN does not unlock the PDF (camelot only says
+        "File has not been decrypted")."""
+        reader = pypdf.PdfReader(io.BytesIO(pdf_source))
+        if reader.is_encrypted and not reader.decrypt(password or ""):
+            raise Exception(
+                f"PDF password did not open the statement: the user's pan_card is wrong "
+                f"(length {len(password or '')}, ends {(password or '')[-2:]!r})"
+            )
+
     def _extract_through_camelot(self, pdf_source, password):
+        self._check_password(pdf_source, password)
         all_tables = []
         with tempfile.NamedTemporaryFile(suffix=".pdf") as temp_pdf:
             temp_pdf.write(pdf_source)
