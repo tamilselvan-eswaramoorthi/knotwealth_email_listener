@@ -21,7 +21,7 @@ async def on_startup():
         print(f"Database initialization failed: {e}")
 
 @app.post("/process")
-async def process_webhook(data: dict = Body(...), x_api_key: str = Header(default="")):
+def process_webhook(data: dict = Body(...), x_api_key: str = Header(default="")):
     # The body carries the full email, so only the Apps Script poller may call this
     if not Config.API_KEY or not secrets.compare_digest(x_api_key, Config.API_KEY):
         return Response(content="Unauthorized", status_code=401)

@@ -1,0 +1,6 @@
+.env
+.env_prod
+credentials.json
+.venv
+__pycache__
+.git

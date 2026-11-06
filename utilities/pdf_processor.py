@@ -286,6 +286,16 @@ class ExtractHoldings:
             return [r for r in res if r.get('quantity') and r.get('rate')]
         return None
 
+    def _nse_trade_date(self, trade_no):
+        """Return the trade date ("YYYY-MM-DD") encoded in an NSE trade number, or None."""
+        match = re.match(r"(\d{8})\d+$", str(trade_no or "").strip())
+        if not match:
+            return None
+        try:
+            return datetime_type.strptime(match.group(1), "%Y%m%d").strftime("%Y-%m-%d")
+        except ValueError:
+            return None
+
     def extract_nse_pdf(self, pdf_source, password, email_date=None):
         """Extract trade rows from an NSE contract note PDF."""
 
@@ -295,10 +305,13 @@ class ExtractHoldings:
 
         final_df = pd.concat(all_tables, ignore_index=True)
         final_df.columns = [str(c).replace('\n', ' ').strip() for c in final_df.columns]
-        check_date = self._parse_date_str(email_date)
         rows = []
         for _, row in final_df.iterrows():
             try:
+                # NSE trade numbers start with the trade date (YYYYMMDD); the email date is only a
+                # fallback because a forwarded alert carries the forwarding date
+                row_date = self._nse_trade_date(row.get('Trade No')) or email_date
+                row_check_date = self._parse_date_str(row_date)
                 raw_symbol   = str(row['Symbol']).strip()
                 company_name = row.get('Name of the Security', raw_symbol)
                 buy_or_sell  = "BUY" if row['Buy/ Sell'] == "B" else "SELL"
@@ -313,9 +326,9 @@ class ExtractHoldings:
                 except (ValueError, TypeError):
                     quantity = 0
                 price          = row['Price (Rs.)']
-                trade_datetime = self._parse_trade_datetime(email_date, row['Trade Time'], nse_fixed_fmt=True)
+                trade_datetime = self._parse_trade_datetime(row_date, row['Trade Time'], nse_fixed_fmt=True)
 
-                early_demerger = get_demerger_by_raw_symbol(raw_symbol, check_date)
+                early_demerger = get_demerger_by_raw_symbol(raw_symbol, row_check_date)
                 if early_demerger:
                     common = {
                         "company_name":     company_name,
@@ -341,7 +354,7 @@ class ExtractHoldings:
                     "exchange":         "NSE",
                     'broker':           broker_name,
                 }
-                rows.extend(self._expand_corporate_actions(base_row, email_date))
+                rows.extend(self._expand_corporate_actions(base_row, row_date))
 
             except Exception as e:
                 print(f"[NSE] Error processing row: {e}")
